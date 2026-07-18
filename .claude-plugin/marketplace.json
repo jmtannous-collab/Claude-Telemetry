@@ -1,0 +1,14 @@
+{
+  "name": "claude-telemetry",
+  "owner": {
+    "name": "jmtannous",
+    "url": "https://github.com/jmtannous-collab"
+  },
+  "plugins": [
+    {
+      "name": "claude-telemetry",
+      "source": "./",
+      "description": "Session telemetry for Claude Code: autonomous work time vs. time blocked on the user, interventions, and token usage — broken down per skill, with a daily report."
+    }
+  ]
+}

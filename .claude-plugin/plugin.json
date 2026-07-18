@@ -1,0 +1,13 @@
+{
+  "name": "claude-telemetry",
+  "version": "0.1.0",
+  "description": "Session telemetry for Claude Code: autonomous work time vs. time blocked on the user, interventions, and token usage — broken down per skill, with a daily report.",
+  "author": {
+    "name": "jmtannous",
+    "url": "https://github.com/jmtannous-collab"
+  },
+  "homepage": "https://github.com/jmtannous-collab/Claude-Telemetry",
+  "repository": "https://github.com/jmtannous-collab/Claude-Telemetry",
+  "license": "MIT",
+  "keywords": ["telemetry", "metrics", "tokens", "session-tracking"]
+}
