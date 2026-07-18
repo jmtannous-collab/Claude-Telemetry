@@ -39,11 +39,11 @@ moment a usage limit is actually hit — the API error only lands in the
 session transcript — so the report detects limit hits from the transcript's
 error markers and resolves the reset time from the last snapshot.
 
-This plugin's hooks append one timestamped line per event to a local log
-(`~/.claude/session-metrics/events.jsonl` — a stable format owned by this
-project). The report script then joins that timeline with Claude Code's own
-session transcripts (which carry per-message token usage) to produce the daily
-summary.
+This plugin's hooks append one timestamped line per event to a local monthly
+log (`~/.claude/session-metrics/events-YYYY-MM.jsonl` — a stable format owned
+by this project; old months can be deleted freely). The report script then
+joins that timeline with Claude Code's own session transcripts (which carry
+per-message token usage) to produce the daily summary.
 
 Nothing leaves your machine. There is no network access, no server, no
 dependency beyond Python 3.9+.
@@ -56,8 +56,12 @@ dependency beyond Python 3.9+.
   the evening mid-session, that gap counts as blocked; interpret long tails
   accordingly.
 - **Rate-limited** — from a usage-limit hit until the limit reset or your
-  next prompt, whichever comes first. This time is carved *out* of "blocked
+  next prompt, whichever comes first (when no reset time can be resolved, a
+  conservative five-hour cap applies). This time is carved *out* of "blocked
   on you", so the two never double-count.
+- **Days are local calendar days.** Segments crossing midnight are split at
+  midnight, so overnight work or waiting is booked to the day it actually
+  happened on.
 - **Interventions** — every prompt you submit, including the first one of a
   session.
 - **Per-skill attribution is sticky** — from the moment a skill is invoked,
@@ -99,24 +103,29 @@ python3 scripts/report.py --days 7 --sessions
 
 | Environment variable | Default | Purpose |
 |---|---|---|
-| `CLAUDE_TELEMETRY_DIR` | `~/.claude/session-metrics` | Where `events.jsonl` is written and read |
+| `CLAUDE_TELEMETRY_DIR` | `~/.claude/session-metrics` | Where the monthly `events-YYYY-MM.jsonl` logs are written and read |
 
 ## Caveats
 
 - **Transcript token parsing.** Claude Code's transcript JSONL format is
-  internal and may change between versions. Timing metrics come entirely from
-  this plugin's own event log and are unaffected; only the token columns
-  depend on transcript parsing, and the report degrades gracefully (times
-  still print) if parsing fails.
+  internal and may change between versions. Autonomous/blocked timing comes
+  entirely from this plugin's own event log and is unaffected; the token
+  columns *and rate-limited detection* depend on transcript parsing, and the
+  report degrades gracefully (other metrics still print) if parsing fails.
 - **Mid-turn permission prompts** are also "waiting on you" but occur before
   `Stop` fires. `Notification` events are logged today and will be folded into
   blocked time in a future version; until then blocked time slightly
   undercounts.
 - **Limit detection is best-effort.** Limit hits are read from transcript
-  error markers (`error: "rate_limit"` / `isApiErrorMessage`), with a
-  conservative text fallback for older Claude Code versions. If a reset time
-  can't be found in the error text or a `rate_limits` snapshot, the limited
-  interval ends at your next prompt.
+  error markers (`error: "rate_limit"` / `isApiErrorMessage`); conversation
+  text is never trusted, so very old Claude Code versions without those
+  markers may miss hits. Reset times come from the error text or a logged
+  `rate_limits` snapshot — note that `rate_limits` on hook stdin is not part
+  of the officially documented payload, so when it's absent the five-hour
+  cap applies instead.
+- **Crashed sessions.** A session with no `SessionEnd` keeps an open working
+  tail (counted to its last event) but drops its trailing blocked time —
+  without a session end there's no evidence you were still waiting.
 - **Windows shells.** Hook commands try `python3` and fall back to `python`.
   `${CLAUDE_PLUGIN_ROOT}` substitution on Windows has known path-format
   quirks under Git Bash ([claude-code#18527](https://github.com/anthropics/claude-code/issues/18527));

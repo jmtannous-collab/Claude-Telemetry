@@ -2,8 +2,9 @@
 """Append one Claude Code hook event to the telemetry log.
 
 Invoked by every hook in hooks/hooks.json. Reads the hook payload from stdin
-and appends a single JSON line to $CLAUDE_TELEMETRY_DIR/events.jsonl
-(default: ~/.claude/session-metrics/events.jsonl):
+and appends a single JSON line to the current month's log,
+$CLAUDE_TELEMETRY_DIR/events-YYYY-MM.jsonl
+(default dir: ~/.claude/session-metrics):
 
     {"ts": "<UTC ISO-8601>", "event": "<hook_event_name>", "payload": {...}}
 
@@ -61,10 +62,11 @@ def main():
             k: v for k, v in tool_input.items() if k in ("skill", "args")
         }
 
+    now = datetime.datetime.now(datetime.timezone.utc)
     line = {
-        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(
-            timespec="seconds"
-        ),
+        # Milliseconds so closely spaced events (Stop then PreToolUse) keep
+        # their true order when the report sorts by timestamp.
+        "ts": now.isoformat(timespec="milliseconds"),
         "event": full.get("hook_event_name", "unknown"),
         "payload": payload,
     }
@@ -73,7 +75,10 @@ def main():
         os.path.expanduser("~"), ".claude", "session-metrics"
     )
     os.makedirs(log_dir, exist_ok=True)
-    with open(os.path.join(log_dir, "events.jsonl"), "a") as f:
+    # One file per month bounds unbounded growth and makes pruning trivial;
+    # the report reads every events*.jsonl in the directory.
+    log_name = f"events-{now:%Y-%m}.jsonl"
+    with open(os.path.join(log_dir, log_name), "a", encoding="utf-8") as f:
         f.write(json.dumps(line, separators=(",", ":")) + "\n")
 
 

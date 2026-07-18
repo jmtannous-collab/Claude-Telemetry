@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Daily telemetry report for Claude Code sessions.
 
-Joins the hook-written event log (events.jsonl, this project's own stable
+Joins the hook-written event log (events-*.jsonl, this project's own stable
 format) with Claude Code's session transcripts (internal format — parsed
 defensively, only for token counts and usage-limit detection) to report,
 per day:
@@ -20,6 +20,7 @@ is invoked or the session ends.
 import argparse
 import bisect
 import datetime as dt
+import glob
 import json
 import os
 import re
@@ -28,9 +29,10 @@ from collections import defaultdict
 
 UNATTRIBUTED = "(unattributed)"
 
-# Matches the user-facing text of a usage-limit API error, across the
-# phrasings Claude Code has used ("usage limit reached", "session limit
-# reached", "5-hour limit reached", ...).
+# When a usage-limit hit has no resolvable reset time, assume at most the
+# five-hour window rather than writing off the rest of the day.
+NO_RESET_CAP = dt.timedelta(hours=5)
+
 LIMIT_TEXT_RE = re.compile(
     r"\b(usage|session|5-hour|five-hour|weekly)\s+limit\b|\blimit reached\b",
     re.IGNORECASE,
@@ -38,13 +40,14 @@ LIMIT_TEXT_RE = re.compile(
 ISO_TS_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?"
 )
+# Older error format: "Claude AI usage limit reached|1721318400"
+EPOCH_TS_RE = re.compile(r"\|\s*(\d{9,12})\b")
 
 
-def default_log_path():
-    log_dir = os.environ.get("CLAUDE_TELEMETRY_DIR") or os.path.join(
+def default_log_location():
+    return os.environ.get("CLAUDE_TELEMETRY_DIR") or os.path.join(
         os.path.expanduser("~"), ".claude", "session-metrics"
     )
-    return os.path.join(log_dir, "events.jsonl")
 
 
 def parse_ts(s):
@@ -58,33 +61,69 @@ def local_date(ts):
     return ts.astimezone().date()
 
 
+def local_day_bounds(day):
+    """Aware [start, end) of a local calendar day. `.astimezone()` on the
+    naive local midnight attaches that date's own UTC offset, so days across
+    a DST change keep the same boundaries as local_date()."""
+    start = dt.datetime.combine(day, dt.time.min).astimezone()
+    end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min).astimezone()
+    return start, end
+
+
+def split_by_local_day(a, b):
+    """Split an aware interval at local midnights so each piece can be
+    bucketed to a single day without cross-midnight distortion."""
+    parts = []
+    m = local_day_bounds(local_date(a))[1]
+    while m < b:
+        parts.append((a, m))
+        a, m = m, local_day_bounds(local_date(m))[1]
+    parts.append((a, b))
+    return parts
+
+
 def is_main_agent(payload):
     # Hooks also fire inside subagents; their timeline events would corrupt
-    # the work/blocked state machine, so only the main agent's events drive it.
-    return payload.get("agent_type") in (None, "", "main")
+    # the work/blocked state machine. Per the hooks docs, agent_id is set
+    # only inside subagent invocations (agent_type also appears for main
+    # sessions launched via `claude --agent`, so it can't be the filter).
+    return not payload.get("agent_id")
 
 
-def load_sessions(log_path):
-    """Parse events.jsonl into {session_id: [events sorted by ts]}."""
-    sessions = defaultdict(list)
-    try:
-        f = open(log_path)
-    except FileNotFoundError:
+def load_sessions(location):
+    """Parse the event log(s) into {session_id: [events sorted by ts]}.
+
+    `location` is the telemetry directory (all events*.jsonl inside it,
+    including the legacy undated file) or a single log file.
+    """
+    if os.path.isdir(location):
+        paths = sorted(glob.glob(os.path.join(location, "events*.jsonl")))
+    else:
+        paths = [location] if os.path.exists(location) else []
+    if not paths:
         sys.exit(
-            f"No event log at {log_path} — have the plugin's hooks run yet?"
+            f"No event log found at {location} — have the plugin's hooks run yet?"
         )
-    with f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-                e["_ts"] = parse_ts(e["ts"])
-            except (json.JSONDecodeError, KeyError, ValueError):
-                continue
-            sid = e.get("payload", {}).get("session_id") or "unknown"
-            sessions[sid].append(e)
+    sessions = defaultdict(list)
+    for path in paths:
+        try:
+            f = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                    e["_ts"] = parse_ts(e["ts"])
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    continue
+                sid = e.get("payload", {}).get("session_id")
+                if not sid:
+                    continue
+                sessions[sid].append(e)
     for events in sessions.values():
         events.sort(key=lambda e: e["_ts"])
     return sessions
@@ -105,38 +144,41 @@ def _content_text(obj):
 
 
 def _is_limit_marker(obj):
+    """True for transcript entries recording a usage-limit exhaustion.
+
+    Requires Claude Code's structured error markers (error/isApiErrorMessage)
+    — plain conversation text is never trusted, since users and agents talk
+    *about* limits. Transient auto-retried rate limits and unrelated token
+    limits are excluded.
+    """
+    text = _content_text(obj).lower()
+    if "retrying" in text or "output token" in text:
+        return False
     if obj.get("error") == "rate_limit":
         return True
-    text = _content_text(obj)
-    if not text:
+    if not obj.get("isApiErrorMessage") or obj.get("type") != "assistant":
         return False
-    if obj.get("isApiErrorMessage") and "limit" in text.lower():
-        return True
-    # Fallback for Claude Code versions without error markers: a short
-    # message naming a limit AND a reset. Ordinary conversation *about*
-    # limits is long-form and lacks the reset phrasing, so it won't match.
-    return (
-        len(text) < 300
-        and bool(LIMIT_TEXT_RE.search(text))
-        and "reset" in text.lower()
+    return bool(LIMIT_TEXT_RE.search(text)) or (
+        "limit" in text and "reset" in text
     )
 
 
 class Session:
     def __init__(self, session_id, events):
         self.session_id = session_id
-        self.work = []  # (start, end, skill)
-        self.blocked = []  # (start, end)
+        self.work = []  # (start, end, skill), split at local midnights
+        self.blocked = []  # (start, end), split at local midnights
         self.interventions = []  # timestamps of UserPromptSubmit
         self.skill_timeline = []  # (ts, skill), chronological
         self.rate_limit_snapshots = []  # (ts, [reset datetimes])
         self.transcript_path = None
         self.cwd = None
-        self.last_event_ts = events[-1]["_ts"] if events else None
+        self.first_event_ts = events[0]["_ts"] if events else None
         self._scanned = False
-        self._usage_entries = []  # (ts, usage dict)
+        self._usage_entries = []  # (ts, dedup key or None, usage dict)
         self._limit_hits = []  # (ts, reset datetime or None)
         self._analyze(events)
+        self._skill_keys = [t for t, _ in self.skill_timeline]
 
     def _analyze(self, events):
         state = None  # None | "working" | "blocked"
@@ -146,8 +188,14 @@ class Session:
         for e in events:
             p = e.get("payload", {})
             ts = e["_ts"]
-            self.transcript_path = p.get("transcript_path") or self.transcript_path
-            self.cwd = p.get("cwd") or self.cwd
+            if is_main_agent(p):
+                # Only main-agent events may set these — a subagent event
+                # carrying its own transcript_path must not clobber the
+                # session's transcript.
+                self.transcript_path = (
+                    p.get("transcript_path") or self.transcript_path
+                )
+                self.cwd = p.get("cwd") or self.cwd
             limits = p.get("rate_limits")
             if isinstance(limits, dict):
                 resets = []
@@ -168,8 +216,10 @@ class Session:
             name = e.get("event")
 
             if name == "SessionStart":
-                if state is None:
-                    state, seg_start = "working", ts
+                # Session boundary only. Work starts at the first prompt —
+                # a terminal sitting open before that is neither work nor
+                # blocked time.
+                pass
             elif name == "UserPromptSubmit":
                 self.interventions.append(ts)
                 if state == "blocked":
@@ -179,7 +229,10 @@ class Session:
             elif name == "Stop":
                 if state == "working":
                     self.work.append((seg_start, ts, skill))
-                state, seg_start = "blocked", ts
+                if state != "blocked":
+                    # Repeated Stops (compaction turns, re-fires) must not
+                    # restart the blocked segment.
+                    state, seg_start = "blocked", ts
             elif name == "SessionEnd":
                 if state == "working":
                     self.work.append((seg_start, ts, skill))
@@ -196,28 +249,47 @@ class Session:
                     skill = new_skill
                     self.skill_timeline.append((ts, skill))
 
-        # A still-open session: count up to its last recorded event.
+        # A still-open session: count an open working tail up to the last
+        # recorded event. A trailing *blocked* state is intentionally not
+        # counted — without a SessionEnd there is no evidence of when (or
+        # whether) the user was still waiting.
         if events and state == "working" and seg_start is not None:
             self.work.append((seg_start, events[-1]["_ts"], skill))
 
+        self.work = [
+            (a2, b2, sk)
+            for a, b, sk in self.work
+            for a2, b2 in split_by_local_day(a, b)
+        ]
+        self.blocked = [
+            (a2, b2)
+            for a, b in self.blocked
+            for a2, b2 in split_by_local_day(a, b)
+        ]
+
     def skill_at(self, ts):
-        keys = [t for t, _ in self.skill_timeline]
-        i = bisect.bisect_right(keys, ts)
+        i = bisect.bisect_right(self._skill_keys, ts)
         return self.skill_timeline[i - 1][1] if i else UNATTRIBUTED
 
     def _scan_transcript(self):
         """One defensive pass over the session transcript, collecting token
-        usage entries and usage-limit hits. Transcript problems only cost the
-        token columns and limit detection — timing metrics are unaffected."""
+        usage entries and usage-limit hits. Transcript problems only cost
+        the token columns and limit detection — the other timing metrics
+        come from the event log and are unaffected."""
         if self._scanned:
             return
         self._scanned = True
         if not self.transcript_path:
             return
         try:
-            f = open(os.path.expanduser(self.transcript_path))
+            f = open(
+                os.path.expanduser(self.transcript_path),
+                encoding="utf-8",
+                errors="replace",
+            )
         except OSError:
             return
+        seen_keys = set()
         with f:
             for line in f:
                 try:
@@ -231,19 +303,30 @@ class Session:
                     ts = parse_ts(ts_s)
                 except ValueError:
                     continue
+                if obj.get("type") == "assistant":
+                    usage = (obj.get("message") or {}).get("usage")
+                    if usage:
+                        # Transcripts write one line per content block, each
+                        # repeating the message's id and usage — count each
+                        # API message once.
+                        key = (
+                            (obj.get("message") or {}).get("id"),
+                            obj.get("requestId"),
+                        )
+                        if key == (None, None):
+                            self._usage_entries.append((ts, None, usage))
+                        elif key not in seen_keys:
+                            seen_keys.add(key)
+                            self._usage_entries.append((ts, key, usage))
                 if _is_limit_marker(obj):
                     self._limit_hits.append((ts, self._resolve_reset(ts, obj)))
-                    continue
-                if obj.get("type") != "assistant":
-                    continue
-                usage = (obj.get("message") or {}).get("usage")
-                if usage:
-                    self._usage_entries.append((ts, usage))
 
     def _resolve_reset(self, hit_ts, obj):
-        """Best-effort reset time for a limit hit: an ISO timestamp in the
-        error text, else the nearest logged rate_limits snapshot."""
-        m = ISO_TS_RE.search(_content_text(obj))
+        """Best-effort reset time for a limit hit: a timestamp in the error
+        text (ISO or trailing |epoch), else the rate_limits snapshot in
+        effect at the hit."""
+        text = _content_text(obj)
+        m = ISO_TS_RE.search(text)
         if m:
             try:
                 reset = parse_ts(m.group(0))
@@ -251,22 +334,45 @@ class Session:
                     return reset
             except ValueError:
                 pass
-        best = None
+        m = EPOCH_TS_RE.search(text)
+        if m:
+            try:
+                reset = dt.datetime.fromtimestamp(
+                    int(m.group(1)), dt.timezone.utc
+                )
+                if reset > hit_ts:
+                    return reset
+            except (ValueError, OverflowError, OSError):
+                pass
+        return self._snapshot_reset(hit_ts)
+
+    def _snapshot_reset(self, hit_ts):
+        """Earliest future reset from the latest snapshot at or before the
+        hit; snapshots recorded later (fresh windows) only as a fallback."""
+        before, after = None, None
         for snap_ts, resets in self.rate_limit_snapshots:
-            for reset in resets:
-                if reset > hit_ts and (best is None or reset < best):
-                    best = reset
-        return best
+            if snap_ts <= hit_ts:
+                before = resets
+            elif after is None:
+                after = resets
+        for resets in (before, after):
+            if resets:
+                future = [r for r in resets if r > hit_ts]
+                if future:
+                    return min(future)
+        return None
 
     def limit_hits(self):
         self._scan_transcript()
         return self._limit_hits
 
     def token_usage(self, dates):
-        """Per-skill token sums, filtered to the given set of local dates."""
+        """Per-skill token sums, filtered to the given set of local dates.
+        Run dedupe_shared_history() first so resumed sessions don't recount
+        copied history."""
         self._scan_transcript()
         totals = defaultdict(lambda: defaultdict(int))
-        for ts, usage in self._usage_entries:
+        for ts, _key, usage in self._usage_entries:
             if dates and local_date(ts) not in dates:
                 continue
             t = totals[self.skill_at(ts)]
@@ -275,6 +381,33 @@ class Session:
             t["cache_r"] += usage.get("cache_read_input_tokens", 0) or 0
             t["out"] += usage.get("output_tokens", 0) or 0
         return totals
+
+
+def dedupe_shared_history(sessions):
+    """Resuming a session copies its history into a new transcript under a
+    new session id. Walk sessions chronologically so the original session
+    keeps its messages and limit hits, and later copies are dropped."""
+    far_future = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+    seen_usage, seen_hits = set(), set()
+    for s in sorted(
+        sessions.values(), key=lambda s: s.first_event_ts or far_future
+    ):
+        s._scan_transcript()
+        kept_usage = []
+        for ts, key, usage in s._usage_entries:
+            if key is not None:
+                if key in seen_usage:
+                    continue
+                seen_usage.add(key)
+            kept_usage.append((ts, key, usage))
+        s._usage_entries = kept_usage
+        kept_hits = []
+        for ts, reset in s._limit_hits:
+            if ts in seen_hits:
+                continue
+            seen_hits.add(ts)
+            kept_hits.append((ts, reset))
+        s._limit_hits = kept_hits
 
 
 def merge_intervals(intervals):
@@ -297,36 +430,26 @@ def overlap_seconds(seg, intervals):
     return total
 
 
-def limited_intervals(day, day_sessions, all_sessions):
-    """[start, end) intervals lost to usage limits on `day`.
+def limited_intervals(day, sessions):
+    """[start, end) intervals lost to usage limits, clipped to `day`.
 
     Each interval runs from the limit hit until the limit reset or the next
-    user prompt anywhere (whichever comes first), clipped to the day.
+    user prompt anywhere (whichever comes first); with no known reset, a
+    conservative five-hour cap applies. Hits are taken from all sessions so
+    an evening hit still surfaces on the following day.
     """
-    tz = dt.datetime.now().astimezone().tzinfo
-    day_start = dt.datetime.combine(day, dt.time.min).replace(tzinfo=tz)
-    day_end = day_start + dt.timedelta(days=1)
-    prompts = sorted(
-        t for s in all_sessions.values() for t in s.interventions
-    )
+    day_start, day_end = local_day_bounds(day)
+    prompts = sorted(t for s in sessions.values() for t in s.interventions)
     intervals = []
-    for s in day_sessions:
+    for s in sessions.values():
         for hit_ts, reset in s.limit_hits():
-            if local_date(hit_ts) != day:
-                continue
-            candidates = [day_end]
-            if reset:
-                candidates.append(reset)
+            end = reset if reset else hit_ts + NO_RESET_CAP
             i = bisect.bisect_right(prompts, hit_ts)
             if i < len(prompts):
-                candidates.append(prompts[i])
-            if reset is None and i >= len(prompts):
-                # No reset time and the user never came back: count up to
-                # the session's last recorded event.
-                candidates.append(max(hit_ts, s.last_event_ts))
-            end = min(candidates)
-            if end > hit_ts:
-                intervals.append((hit_ts, min(end, day_end)))
+                end = min(end, prompts[i])
+            a, b = max(hit_ts, day_start), min(end, day_end)
+            if b > a:
+                intervals.append((a, b))
     return merge_intervals(intervals)
 
 
@@ -368,16 +491,16 @@ def report_day(day, sessions, show_sessions):
         )
         if active:
             day_sessions.append(s)
-    if not day_sessions:
-        return False
 
-    limited = limited_intervals(day, day_sessions, sessions)
+    limited = limited_intervals(day, sessions)
     limit_hits = sum(
         1
-        for s in day_sessions
+        for s in sessions.values()
         for hit_ts, _ in s.limit_hits()
         if local_date(hit_ts) == day
     )
+    if not day_sessions and not limited and not limit_hits:
+        return False
 
     interventions = sum(
         1 for s in day_sessions for t in s.interventions if local_date(t) == day
@@ -427,12 +550,15 @@ def report_day(day, sessions, show_sessions):
                 line += f"   {fmt_usage(tokens_by_skill[sk])}"
             print(line)
 
-    if show_sessions:
+    if show_sessions and day_sessions:
         print("  sessions:")
         far_future = dt.datetime.max.replace(tzinfo=dt.timezone.utc)
-        for s in sorted(
-            day_sessions, key=lambda s: s.work[0][0] if s.work else far_future
-        ):
+
+        def day_start_key(s):
+            starts = [a for a, _, _ in s.work if local_date(a) == day]
+            return min(starts) if starts else far_future
+
+        for s in sorted(day_sessions, key=day_start_key):
             w = sum(
                 (b - a).total_seconds()
                 for a, b, _ in s.work
@@ -449,7 +575,7 @@ def report_day(day, sessions, show_sessions):
             iv = sum(1 for t in s.interventions if local_date(t) == day)
             label = os.path.basename(s.cwd) if s.cwd else s.session_id[:8]
             print(
-                f"    · {label}: {iv} interventions, "
+                f"    · {label}: {iv} intervention{'s' if iv != 1 else ''}, "
                 f"autonomous {fmt_duration(w)}, blocked {fmt_duration(bl)}"
             )
     return True
@@ -464,13 +590,20 @@ def main():
     ap.add_argument(
         "--sessions", action="store_true", help="include per-session detail"
     )
-    ap.add_argument("--log", default=default_log_path(), help="event log path")
+    ap.add_argument(
+        "--log",
+        default=default_log_location(),
+        help="event log file, or directory containing events*.jsonl",
+    )
     args = ap.parse_args()
+    if args.date and args.days != 1:
+        ap.error("--date and --days are mutually exclusive")
 
     sessions = {
         sid: Session(sid, events)
         for sid, events in load_sessions(args.log).items()
     }
+    dedupe_shared_history(sessions)
 
     if args.date:
         days = [dt.date.fromisoformat(args.date)]
