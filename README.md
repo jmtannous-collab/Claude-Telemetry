@@ -11,12 +11,40 @@ A [Claude Code](https://code.claude.com) plugin that answers, at the end of your
 
 ```
 2026-07-18 — 3 sessions, 11 interventions, 1 limit hit
-  autonomous 4h32m · blocked on you 38m · rate-limited 2h29m
+  autonomous 4h10m · blocked on you 5h37m · rate-limited 33m
   by skill:
-    doc-as-code:build-feature   3h10m   in 1.8M (cache 1.5M) / out 240k
-    code-review                   41m   in 620k (cache 510k) / out 85k
-    (unattributed)                41m   in 310k (cache 250k) / out 40k
+    ── doc-as-code:build-feature     1h49m   in 1.8M (cache 1.5M) / out 240k
+    ══ simplify                      1h09m   in 620k (cache 510k) / out 85k
+    ━━ code-review                     39m   in 310k (cache 250k) / out 40k
+    ┄┄ (unattributed)                  33m   in 120k (cache 90k) / out 12k
+  by hour:
+  1h00m │                          ╭──╮                             ╔══╗
+        │                          │  │                             ║  ║
+    50m │                          │  │                             ║  ║
+        │                          │  ╰──╮                          ║  ║
+    40m │                          │     │        ┏━━┓              ║  ║
+        │                          │     │        ┃  ┃              ║  ║
+    30m │                          │     │        ┃  ┃              ║  ║     ╭┄┄┄
+        │                          │     │        ┃  ┃              ║  ║     ┆
+    20m │                          │     │        ┃  ┃              ║  ║     ┆
+        │                          │     │        ┃  ┃              ║  ║     ┆
+    10m │                          │     │        ┃  ┃              ║  ╚══╗  ┆
+        │                          │     ╰──╮     ┃  ┃              ║     ║  ┆
+      0 └──────────────────────────╯━━━━━━━━╰────────────────────────────────────
+         0        3        6        9        12       15       18       21   (hour of day)
 ```
+
+Each day's report ends with a **by-hour line chart of the 24-hour day**, in
+the style of Claude Code's own `/stats` charts: one step curve per skill,
+tracing how many minutes of each hour were autonomous work in that skill —
+a long uninterrupted stretch shows up as a sustained high curve, and idle
+skills rest on the baseline. In a terminal (including Claude Code's) the
+curves are ANSI-colored, one color per skill — the same color marks the
+skill in the by-skill table. Colors are assigned by each skill's first-ever
+invocation, so a skill keeps its color across days and reports. With
+`NO_COLOR=1` (or piped outside Claude Code) each curve falls back to its
+own box-drawing line style, as in the example above;
+`FORCE_COLOR`/`CLICOLOR_FORCE` are honored too.
 
 Works on macOS, Linux, and Windows. Requires Python 3.9+ on `PATH` (as
 `python3` or `python`); nothing else.

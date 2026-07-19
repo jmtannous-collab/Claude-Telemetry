@@ -12,6 +12,13 @@ per day:
     user prompt, whichever comes first)
   - autonomous time and token usage broken down per skill
 
+Each day's report includes a terminal line chart of the 24 hours: one step
+curve per skill, showing how many minutes of each hour were autonomous work
+in that skill (curves rest on the baseline while a skill is idle). Curves
+are colored (ANSI) on a terminal and fall back to per-skill line styles
+when piped; the same color/style marks the skill in the by-skill table, and
+a skill keeps its color across days and reports.
+
 Skill attribution is sticky: from the moment a skill is invoked, all later
 autonomous time and tokens in that session belong to it until another skill
 is invoked or the session ends.
@@ -453,6 +460,172 @@ def limited_intervals(day, sessions):
     return merge_intervals(intervals)
 
 
+# Categorical palette (hex), validated for CVD separation and dark-surface
+# contrast. Slots are assigned to skills in order of first-ever invocation
+# across the whole log, so a skill keeps its color across days and reports
+# as history grows.
+GRAPH_COLORS = [
+    "#3987e5",  # blue
+    "#008300",  # green
+    "#d55181",  # magenta
+    "#c98500",  # yellow
+    "#199e70",  # aqua
+    "#d95926",  # orange
+    "#9085e9",  # violet
+    "#e66767",  # red
+]
+GRAPH_MUTED = "#898781"  # (unattributed) and any skill past the 8 slots
+ANSI_RESET = "\x1b[0m"
+
+# Box-drawing character sets for the step curves. With color every skill
+# uses the rounded set (color carries identity); without color the sets
+# cycle so overlapping curves stay tellable-apart.
+LINE_SETS = [
+    {"h": "─", "v": "│", "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯"},
+    {"h": "━", "v": "┃", "tl": "┏", "tr": "┓", "bl": "┗", "br": "┛"},
+    {"h": "═", "v": "║", "tl": "╔", "tr": "╗", "bl": "╚", "br": "╝"},
+    {"h": "┅", "v": "┇", "tl": "┏", "tr": "┓", "bl": "┗", "br": "┛"},
+    {"h": "┈", "v": "┊", "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯"},
+]
+MUTED_SET = {"h": "┄", "v": "┆", "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯"}
+
+
+def assign_skill_slots(sessions):
+    """{skill: slot index or None} by first invocation anywhere in the log.
+    None means muted gray. UNATTRIBUTED is always muted so real skills never
+    shift color when unattributed time appears."""
+    first_seen = {}
+    for s in sessions.values():
+        for ts, skill in s.skill_timeline:
+            if skill not in first_seen or ts < first_seen[skill]:
+                first_seen[skill] = ts
+    slots = {UNATTRIBUTED: None}
+    for i, skill in enumerate(sorted(first_seen, key=first_seen.get)):
+        slots[skill] = i if i < len(GRAPH_COLORS) else None
+    return slots
+
+
+def _fmt_minutes(m):
+    return "0" if m == 0 else fmt_duration(m * 60)
+
+
+def color_enabled():
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR") or os.environ.get("CLICOLOR_FORCE"):
+        return True
+    # Claude Code captures command output through a pipe but renders it in a
+    # terminal that understands ANSI, so color is safe there despite no TTY.
+    return sys.stdout.isatty() or bool(os.environ.get("CLAUDECODE"))
+
+
+def _paint(s, hex_color):
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
+    return f"\x1b[38;2;{r};{g};{b}m{s}{ANSI_RESET}"
+
+
+def _skill_hex(skill, slots):
+    slot = slots.get(skill)
+    return GRAPH_MUTED if slot is None else GRAPH_COLORS[slot]
+
+
+def _skill_line_set(skill, slots, color):
+    slot = slots.get(skill)
+    if slot is None:
+        return LINE_SETS[0] if color else MUTED_SET
+    return LINE_SETS[0] if color else LINE_SETS[slot % len(LINE_SETS)]
+
+
+def skill_key(skill, slots, color):
+    """Two-character visual key for a skill: a colored dot on terminals, a
+    sample of the skill's line style otherwise. The same identity marks the
+    chart curve and the by-skill table."""
+    if color:
+        return _paint("● ", _skill_hex(skill, slots))
+    return _skill_line_set(skill, slots, color)["h"] * 2
+
+
+def print_day_chart(day, day_sessions, slots, color):
+    """One step curve per skill over the day's 24 hours: minutes of that
+    hour spent working autonomously in the skill. Curves sit on the
+    baseline where a skill was idle, /stats-style."""
+    day_start, _ = local_day_bounds(day)
+    series = defaultdict(lambda: [0.0] * 24)  # skill -> minutes per hour
+    for s in day_sessions:
+        for a, b, skill in s.work:
+            if local_date(a) != day:
+                continue
+            for h in range(24):
+                hs = day_start + dt.timedelta(hours=h)
+                lo, hi = max(a, hs), min(b, hs + dt.timedelta(hours=1))
+                if hi > lo:
+                    series[skill][h] += (hi - lo).total_seconds() / 60
+    peak = max((max(v) for v in series.values()), default=0)
+    if peak <= 0:
+        return
+
+    for tick in (5, 10, 15, 30, 60):
+        if peak / tick <= 6:
+            break
+    top = max(tick, int(-(-peak // tick) * tick))
+    unit = tick / 2  # minutes per chart row; labels sit on even rows
+    nrows = round(top / unit)
+    width = 24 * 3
+
+    order = sorted(
+        series,
+        key=lambda sk: (slots.get(sk) is None, slots.get(sk) or 0, sk),
+    )
+    # canvas[level][col] = (glyph, skill); level 0 is the baseline row.
+    # Curves are drawn in reverse slot order so earlier slots end up on top
+    # where they overlap.
+    canvas = [[None] * width for _ in range(nrows + 1)]
+    for sk in reversed(order):
+        chars = _skill_line_set(sk, slots, color)
+
+        def put(level, col, part):
+            canvas[level][col] = (chars[part], sk)
+
+        lv = [min(nrows, round(v / unit)) for v in series[sk]]
+        for h in range(24):
+            c, y = h * 3, lv[h]
+            put(y, c, "h")
+            put(y, c + 1, "h")
+            nxt = lv[h + 1] if h < 23 else y
+            if nxt == y:
+                put(y, c + 2, "h")
+            elif nxt > y:  # rising step
+                put(y, c + 2, "br")
+                for yy in range(y + 1, nxt):
+                    put(yy, c + 2, "v")
+                put(nxt, c + 2, "tl")
+            else:  # falling step
+                put(y, c + 2, "tr")
+                for yy in range(nxt + 1, y):
+                    put(yy, c + 2, "v")
+                put(nxt, c + 2, "bl")
+
+    def cell(entry):
+        glyph, sk = entry
+        return _paint(glyph, _skill_hex(sk, slots)) if color else glyph
+
+    print("  by hour:")
+    for r in range(nrows, 0, -1):
+        label = _fmt_minutes(int(r * unit)) if r % 2 == 0 else ""
+        row = "".join(cell(c) if c else " " for c in canvas[r])
+        print(f"  {label:>5} │{row.rstrip()}")
+    base = "".join(
+        cell(c) if c else (_paint("─", GRAPH_MUTED) if color else "─")
+        for c in canvas[0]
+    )
+    print(f"  {'0':>5} └{base}")
+    axis = [" "] * width
+    for h in range(0, 24, 3):
+        for i, ch in enumerate(str(h)):
+            axis[h * 3 + i] = ch
+    print("         " + "".join(axis).rstrip() + "   (hour of day)")
+
+
 def fmt_duration(seconds):
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
@@ -481,7 +654,7 @@ def fmt_usage(t):
     return s + f" / out {fmt_tokens(t['out'])}"
 
 
-def report_day(day, sessions, show_sessions):
+def report_day(day, sessions, show_sessions, slots):
     day_sessions = []
     for s in sessions.values():
         active = (
@@ -541,14 +714,19 @@ def report_day(day, sessions, show_sessions):
         line += f" · rate-limited {fmt_duration(limited_total)}"
     print(line)
     skills = sorted(work_by_skill, key=work_by_skill.get, reverse=True)
+    color = color_enabled()
     if skills:
         print("  by skill:")
         width = max(len(sk) for sk in skills) + 2
         for sk in skills:
-            line = f"    {sk:<{width}} {fmt_duration(work_by_skill[sk]):>7}"
+            line = (
+                f"    {skill_key(sk, slots, color)} "
+                f"{sk:<{width}} {fmt_duration(work_by_skill[sk]):>7}"
+            )
             if sk in tokens_by_skill:
                 line += f"   {fmt_usage(tokens_by_skill[sk])}"
             print(line)
+        print_day_chart(day, day_sessions, slots, color)
 
     if show_sessions and day_sessions:
         print("  sessions:")
@@ -578,6 +756,7 @@ def report_day(day, sessions, show_sessions):
                 f"    · {label}: {iv} intervention{'s' if iv != 1 else ''}, "
                 f"autonomous {fmt_duration(w)}, blocked {fmt_duration(bl)}"
             )
+
     return True
 
 
@@ -605,6 +784,8 @@ def main():
     }
     dedupe_shared_history(sessions)
 
+    slots = assign_skill_slots(sessions)
+
     if args.date:
         days = [dt.date.fromisoformat(args.date)]
     else:
@@ -614,7 +795,7 @@ def main():
 
     printed = False
     for i, day in enumerate(days):
-        if report_day(day, sessions, args.sessions):
+        if report_day(day, sessions, args.sessions, slots):
             printed = True
             if i < len(days) - 1:
                 print()
