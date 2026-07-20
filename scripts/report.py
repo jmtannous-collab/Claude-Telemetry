@@ -519,9 +519,49 @@ def color_enabled():
     return sys.stdout.isatty() or bool(os.environ.get("CLAUDECODE"))
 
 
+def _hex_rgb(hex_color):
+    return tuple(int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
+
+
+def _truecolor_supported():
+    """Whether the terminal renders 24-bit color. Apple Terminal.app sets
+    COLORTERM but only supports the 256-color palette, so exclude it
+    explicitly rather than trusting COLORTERM alone."""
+    if os.environ.get("TERM_PROGRAM") == "Apple_Terminal":
+        return False
+    return os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit")
+
+
+_CUBE = (0, 95, 135, 175, 215, 255)
+
+
+def _nearest_256(hex_color):
+    """Nearest xterm-256 index for a hex color, choosing between the 6x6x6
+    color cube and the 24-step gray ramp — universally supported, unlike
+    24-bit truecolor."""
+    r, g, b = _hex_rgb(hex_color)
+
+    def cube_idx(v):
+        return min(range(6), key=lambda i: abs(_CUBE[i] - v))
+
+    ri, gi, bi = cube_idx(r), cube_idx(g), cube_idx(b)
+    cube = 16 + 36 * ri + 6 * gi + bi
+    cr, cg, cb = _CUBE[ri], _CUBE[gi], _CUBE[bi]
+
+    gray = round((r + g + b) / 3)
+    gramp = 232 + max(0, min(23, round((gray - 8) / 10)))
+    gv = 8 + 10 * (gramp - 232)
+
+    d_cube = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2
+    d_gray = (r - gv) ** 2 + (g - gv) ** 2 + (b - gv) ** 2
+    return gramp if d_gray < d_cube else cube
+
+
 def _paint(s, hex_color):
-    r, g, b = (int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
-    return f"\x1b[38;2;{r};{g};{b}m{s}{ANSI_RESET}"
+    if _truecolor_supported():
+        r, g, b = _hex_rgb(hex_color)
+        return f"\x1b[38;2;{r};{g};{b}m{s}{ANSI_RESET}"
+    return f"\x1b[38;5;{_nearest_256(hex_color)}m{s}{ANSI_RESET}"
 
 
 def _skill_hex(skill, slots):
