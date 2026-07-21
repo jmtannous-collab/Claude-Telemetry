@@ -875,7 +875,15 @@ def report_day(day, sessions, show_sessions, slots):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--date", help="report a specific day (YYYY-MM-DD)")
+    ap.add_argument(
+        "day",
+        nargs="?",
+        help='day to report: "today", "yesterday", or YYYY-MM-DD '
+        "(default today); same as --date",
+    )
+    ap.add_argument(
+        "--date", help='report a specific day: "today", "yesterday", or YYYY-MM-DD'
+    )
     ap.add_argument(
         "--days", type=int, default=1, help="report the last N days (default 1)"
     )
@@ -888,8 +896,30 @@ def main():
         help="event log file, or directory containing events*.jsonl",
     )
     args = ap.parse_args()
-    if args.date and args.days != 1:
-        ap.error("--date and --days are mutually exclusive")
+
+    def resolve_day(token):
+        t = token.strip().lower()
+        if t == "today":
+            return dt.date.today()
+        if t == "yesterday":
+            return dt.date.today() - dt.timedelta(days=1)
+        try:
+            return dt.date.fromisoformat(token.strip())
+        except ValueError:
+            ap.error(
+                f'invalid day {token!r}: use "today", "yesterday", or YYYY-MM-DD'
+            )
+
+    # The positional day and --date name the same thing; accept either, and
+    # reject only when both are given and resolve to different dates.
+    target = resolve_day(args.date) if args.date else None
+    if args.day:
+        d = resolve_day(args.day)
+        if target is not None and d != target:
+            ap.error("positional day and --date disagree; pass only one")
+        target = d
+    if target is not None and args.days != 1:
+        ap.error("a specific day and --days are mutually exclusive")
 
     sessions = {
         sid: Session(sid, events)
@@ -899,8 +929,8 @@ def main():
 
     slots = assign_skill_slots(sessions)
 
-    if args.date:
-        days = [dt.date.fromisoformat(args.date)]
+    if target is not None:
+        days = [target]
     else:
         today = dt.date.today()
         days = [today - dt.timedelta(days=i) for i in range(args.days)]
