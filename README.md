@@ -116,6 +116,7 @@ Ask for your report with the bundled skill:
 
 ```
 /claude-telemetry:daily-report            # today
+/claude-telemetry:daily-report yesterday  # or: today, or a YYYY-MM-DD date
 /claude-telemetry:daily-report --date 2026-07-17
 /claude-telemetry:daily-report --days 7   # last 7 days
 /claude-telemetry:daily-report --sessions # per-session detail
@@ -124,6 +125,7 @@ Ask for your report with the bundled skill:
 Or run the script directly, outside Claude Code:
 
 ```
+python3 scripts/report.py yesterday --sessions
 python3 scripts/report.py --days 7 --sessions
 ```
 
@@ -140,10 +142,13 @@ python3 scripts/report.py --days 7 --sessions
   entirely from this plugin's own event log and is unaffected; the token
   columns *and rate-limited detection* depend on transcript parsing, and the
   report degrades gracefully (other metrics still print) if parsing fails.
-- **Mid-turn permission prompts** are also "waiting on you" but occur before
-  `Stop` fires. `Notification` events are logged today and will be folded into
-  blocked time in a future version; until then blocked time slightly
-  undercounts.
+- **Mid-turn waits.** An `idle_prompt` notification (Claude finished and is
+  waiting on you) now ends the autonomous turn just like a `Stop`, so a
+  walk-away that ends without a recorded `Stop` counts as blocked, not as
+  work. Permission prompts are different: Claude resumes the *same* turn after
+  you approve, and with no "resumed" signal available the post-approval work
+  can't be separated out — so time spent waiting at a permission prompt can
+  still slightly undercount blocked time.
 - **Limit detection is best-effort.** Limit hits are read from transcript
   error markers (`error: "rate_limit"` / `isApiErrorMessage`); conversation
   text is never trusted, so very old Claude Code versions without those
