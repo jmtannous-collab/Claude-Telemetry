@@ -238,6 +238,12 @@ class Session:
                     p.get("transcript_path") or self.transcript_path
                 )
                 self.cwd = p.get("cwd") or self.cwd
+            if not is_main_agent(p):
+                continue
+            # Rate-limit snapshots are read only from main-agent events, for
+            # the same reason as above: subagent events must not drive
+            # session-level state. Limits are account-wide, so the main
+            # timeline still observes every window that matters.
             limits = p.get("rate_limits")
             if isinstance(limits, dict):
                 resets = []
@@ -253,8 +259,6 @@ class Session:
                             pass
                 if resets:
                     self.rate_limit_snapshots.append((ts, resets))
-            if not is_main_agent(p):
-                continue
             name = e.get("event")
 
             if name == "SessionStart":
@@ -648,15 +652,22 @@ def print_day_chart(day, day_sessions, slots, color, limited=()):
     hour spent working autonomously in the skill. Curves sit on the
     baseline where a skill was idle, /stats-style. Rate-limited time is
     excluded so the curves match the by-skill autonomous totals."""
-    day_start, _ = local_day_bounds(day)
+    _, day_end = local_day_bounds(day)
+    # Hour-bucket edges as local wall-clock hours, made aware with
+    # .astimezone() (the local_day_bounds idiom). Across a DST change each
+    # bucket then spans its true real duration — a fall-back hour is 2h wide,
+    # a spring-forward gap is empty — so the 24 buckets always tile the actual
+    # local day and the 0..23 hour labels stay aligned with their data.
+    edges = [
+        dt.datetime.combine(day, dt.time(hour=h)).astimezone() for h in range(24)
+    ] + [day_end]
     series = defaultdict(lambda: [0.0] * 24)  # skill -> minutes per hour
     for s in day_sessions:
         for a, b, skill in s.work:
             if local_date(a) != day:
                 continue
             for h in range(24):
-                hs = day_start + dt.timedelta(hours=h)
-                lo, hi = max(a, hs), min(b, hs + dt.timedelta(hours=1))
+                lo, hi = max(a, edges[h]), min(b, edges[h + 1])
                 if hi > lo:
                     mins = (
                         (hi - lo).total_seconds()
