@@ -761,11 +761,21 @@ def fmt_tokens(n):
 
 
 def fmt_usage(t):
+    # `total_in` sums input across every turn, so in a long agentic session it
+    # is dominated by cache reads — the same context re-billed each turn. To
+    # keep that from reading as "150M of information came in", also show the
+    # first-seen volume (uncached input + cache writes) and the cache hit rate
+    # (share of input served from cache). The two reconcile: new ~= total_in x
+    # (1 - hit).
     total_in = t["in"] + t["cache_w"] + t["cache_r"]
-    cached = t["cache_w"] + t["cache_r"]
+    new_in = t["in"] + t["cache_w"]
     s = f"in {fmt_tokens(total_in)}"
-    if cached:
-        s += f" (cache {fmt_tokens(cached)})"
+    # Only cache *reads* inflate total_in above the first-seen volume, so the
+    # breakdown is shown only when there are reads (which also guarantees
+    # total_in > 0). Without reads, new_in == total_in and the clause is noise.
+    if t["cache_r"]:
+        hit = round(100 * t["cache_r"] / total_in)
+        s += f" (new {fmt_tokens(new_in)} · {hit}% cached)"
     return s + f" / out {fmt_tokens(t['out'])}"
 
 
