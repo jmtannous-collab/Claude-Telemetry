@@ -49,6 +49,41 @@ ISO_TS_RE = re.compile(
 )
 # Older error format: "Claude AI usage limit reached|1721318400"
 EPOCH_TS_RE = re.compile(r"\|\s*(\d{9,12})\b")
+# Current inline format: "…resets 12:40pm (America/Toronto)" — a wall-clock
+# time in a named zone, with no date. Groups: hour, optional minute, am/pm,
+# zone name.
+RESET_LOCAL_RE = re.compile(
+    r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)",
+    re.IGNORECASE,
+)
+
+
+def _parse_local_reset(text, hit_ts):
+    """Resolve a "resets H[:MM]am/pm (Zone)" phrase to the next occurrence of
+    that local wall-clock time at or after the hit, returned as an aware UTC
+    datetime. None if the phrase is absent, malformed, or the zone can't be
+    loaded (zoneinfo/tzdata missing)."""
+    m = RESET_LOCAL_RE.search(text)
+    if not m:
+        return None
+    hour = int(m.group(1)) % 12
+    if m.group(3).lower() == "pm":
+        hour += 12
+    minute = int(m.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(m.group(4).strip())
+    except Exception:
+        return None
+    local_hit = hit_ts.astimezone(tz)
+    cand = local_hit.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if cand <= local_hit:
+        # The stated time has already passed today, so it's tomorrow's.
+        cand += dt.timedelta(days=1)
+    return cand.astimezone(dt.timezone.utc)
 
 
 def default_log_location():
@@ -350,8 +385,8 @@ class Session:
 
     def _resolve_reset(self, hit_ts, obj):
         """Best-effort reset time for a limit hit: a timestamp in the error
-        text (ISO or trailing |epoch), else the rate_limits snapshot in
-        effect at the hit."""
+        text (ISO, trailing |epoch, or a "resets H:MMam (Zone)" wall-clock),
+        else the rate_limits snapshot in effect at the hit."""
         text = _content_text(obj)
         m = ISO_TS_RE.search(text)
         if m:
@@ -371,6 +406,9 @@ class Session:
                     return reset
             except (ValueError, OverflowError, OSError):
                 pass
+        local = _parse_local_reset(text, hit_ts)
+        if local and local > hit_ts:
+            return local
         return self._snapshot_reset(hit_ts)
 
     def _snapshot_reset(self, hit_ts):
@@ -605,10 +643,11 @@ def skill_key(skill, slots, color):
     return _skill_line_set(skill, slots, color)["h"] * 2
 
 
-def print_day_chart(day, day_sessions, slots, color):
+def print_day_chart(day, day_sessions, slots, color, limited=()):
     """One step curve per skill over the day's 24 hours: minutes of that
     hour spent working autonomously in the skill. Curves sit on the
-    baseline where a skill was idle, /stats-style."""
+    baseline where a skill was idle, /stats-style. Rate-limited time is
+    excluded so the curves match the by-skill autonomous totals."""
     day_start, _ = local_day_bounds(day)
     series = defaultdict(lambda: [0.0] * 24)  # skill -> minutes per hour
     for s in day_sessions:
@@ -619,7 +658,12 @@ def print_day_chart(day, day_sessions, slots, color):
                 hs = day_start + dt.timedelta(hours=h)
                 lo, hi = max(a, hs), min(b, hs + dt.timedelta(hours=1))
                 if hi > lo:
-                    series[skill][h] += (hi - lo).total_seconds() / 60
+                    mins = (
+                        (hi - lo).total_seconds()
+                        - overlap_seconds((lo, hi), limited)
+                    ) / 60
+                    if mins > 0:
+                        series[skill][h] += mins
     peak = max((max(v) for v in series.values()), default=0)
     if peak <= 0:
         return
@@ -744,7 +788,13 @@ def report_day(day, sessions, show_sessions, slots):
     for s in day_sessions:
         for a, b, skill in s.work:
             if local_date(a) == day:
-                work_by_skill[skill] += (b - a).total_seconds()
+                # Time spent rate-limited is reported separately; a limit hit
+                # mid-turn (no Stop until reset) would otherwise count the
+                # stall as both autonomous work and rate-limited.
+                work_by_skill[skill] += max(
+                    0.0,
+                    (b - a).total_seconds() - overlap_seconds((a, b), limited),
+                )
         for a, b in s.blocked:
             if local_date(a) == day:
                 # Time spent rate-limited is reported separately, not as
@@ -786,7 +836,7 @@ def report_day(day, sessions, show_sessions, slots):
             if sk in tokens_by_skill:
                 line += f"   {fmt_usage(tokens_by_skill[sk])}"
             print(line)
-        print_day_chart(day, day_sessions, slots, color)
+        print_day_chart(day, day_sessions, slots, color, limited)
 
     if show_sessions and day_sessions:
         print("  sessions:")
@@ -798,7 +848,10 @@ def report_day(day, sessions, show_sessions, slots):
 
         for s in sorted(day_sessions, key=day_start_key):
             w = sum(
-                (b - a).total_seconds()
+                max(
+                    0.0,
+                    (b - a).total_seconds() - overlap_seconds((a, b), limited),
+                )
                 for a, b, _ in s.work
                 if local_date(a) == day
             )
