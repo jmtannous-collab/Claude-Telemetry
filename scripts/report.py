@@ -240,6 +240,26 @@ class Session:
                     # Repeated Stops (compaction turns, re-fires) must not
                     # restart the blocked segment.
                     state, seg_start = "blocked", ts
+            elif name == "Notification":
+                # A turn can end without a recorded Stop (the hook can miss,
+                # or the user walks away mid-turn). An idle_prompt fires when
+                # Claude has finished and is waiting on the user, so it marks
+                # the autonomous turn as over just like a Stop. Without this,
+                # a walk-away — sometimes over an hour — is silently counted
+                # as autonomous work. If a Stop already fired, state is
+                # "blocked" and this is a no-op. Work resumes on the next
+                # UserPromptSubmit.
+                #
+                # permission_prompt is deliberately NOT handled here: Claude
+                # resumes the *same* turn after approval, and with only Skill
+                # PreToolUse logged (no PostToolUse) there is no signal for
+                # when work resumes — so treating it as blocked would reclas-
+                # sify the genuine post-approval work as "blocked on you".
+                if state == "working" and (
+                    p.get("notification_type") == "idle_prompt"
+                ):
+                    self.work.append((seg_start, ts, skill))
+                    state, seg_start = "blocked", ts
             elif name == "SessionEnd":
                 if state == "working":
                     self.work.append((seg_start, ts, skill))
